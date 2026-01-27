@@ -1,3 +1,3 @@
 [submodule "data/geoopt"]
 	path = data/geoopt
-	url = git@github.com:yhsure/geoopt.git
+	url = https://github.com/yhsure/geoopt.git
