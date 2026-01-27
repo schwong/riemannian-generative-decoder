@@ -6,6 +6,7 @@ chumby/
 
 *.joblib
 *.txt 
+!requirements.txt
 *.csv
 # *.tsv
 *.fasta
