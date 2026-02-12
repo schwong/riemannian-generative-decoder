@@ -190,3 +190,75 @@ def get_representations(model, loader, loss_fn, n_start_points_per_sample=100, n
             loss.backward()
         optimizer.step()
     return z
+
+
+def load_rgd_checkpoint(checkpoint_path, model_cls, manifold=None, device="cpu", load_reps=True):
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    dim_list = ckpt.get("dim_list")
+    if dim_list is None:
+        raise ValueError("Checkpoint missing 'dim_list'.")
+    if manifold is None:
+        c = ckpt.get("c")
+        if c is None:
+            raise ValueError("Checkpoint missing curvature 'c'. Provide manifold explicitly.")
+        manifold = geoopt.manifolds.Lorentz(k=c)
+    try:
+        model = model_cls(dim_list, manifold, device=device)
+    except TypeError:
+        model = model_cls(dim_list, manifold)
+    state = ckpt.get("state_dict")
+    if state is None:
+        raise ValueError("Checkpoint missing 'state_dict'.")
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    unexpected = [k for k in unexpected if k not in {"z", "z_val", "z_test"}]
+    if unexpected:
+        raise RuntimeError(f"Unexpected keys in state_dict: {unexpected}")
+    if load_reps:
+        for key in ("z", "z_val", "z_test"):
+            if key in state:
+                setattr(model, key, state[key].to(device))
+    model.to(device)
+    model.eval()
+    return model, ckpt
+
+
+def sample_subset(z, n_sample=5000, seed=42):
+    if n_sample is None or n_sample >= len(z):
+        idx = torch.arange(len(z))
+        return z, idx.cpu().numpy()
+    g = torch.Generator(device=z.device if torch.is_tensor(z) else "cpu")
+    g.manual_seed(seed)
+    idx = torch.randperm(len(z), generator=g)[:n_sample]
+    return z[idx], idx.cpu().numpy()
+
+
+def compute_dist_matrix(z, manifold, device="cpu"):
+    z = z.to(device)
+    n = len(z)
+    dist_matrix = np.empty((n, n), dtype=np.float32)
+    with torch.no_grad():
+        for i in range(n):
+            if (i + 1) % 100 == 0 or i == n - 1:
+                print(f"Manifold distance progress: {i+1}/{n}", end="\r")
+            d_i = manifold.dist(z[i:i + 1], z).detach().cpu().numpy().squeeze()
+            dist_matrix[i] = d_i
+    print(f"Manifold distance progress: {n}/{n}")
+    # Check for symmetry
+    if not np.allclose(dist_matrix, dist_matrix.T, rtol=1e-4, atol=1e-6):
+        max_err = np.max(np.abs(dist_matrix - dist_matrix.T))
+        print(f"Warning: dist_matrix is not symmetric (max |A-A^T| = {max_err:.6e})")
+    return dist_matrix
+
+
+def write_phylip_dist_matrix(dist_matrix, out_path, labels=None, precision=6):
+    n = dist_matrix.shape[0]
+    if labels is None:
+        labels = [f"S{i+1:05d}" for i in range(n)]
+    if len(labels) != n:
+        raise ValueError("labels length must match dist_matrix size.")
+    with open(out_path, "w") as f:
+        f.write(f"{n}\n")
+        for label, row in zip(labels, dist_matrix):
+            name = str(label)[:10].ljust(10)
+            row_str = " ".join(f"{x:.{precision}f}" for x in row)
+            f.write(f"{name} {row_str}\n")
