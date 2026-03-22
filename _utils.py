@@ -1,13 +1,18 @@
+from matplotlib import colors
 import torch
 import matplotlib.pyplot as plt
 import matplotlib
 import numpy as np
 import random
-from tqdm import trange
+from tqdm import trange, tqdm
 import geoopt
 import matplotlib as mpl
 import torch.nn.functional as F
 from scipy.stats import spearmanr
+from matplotlib.lines import Line2D
+from pathlib import Path
+import pandas as pd
+from matplotlib.colors import ListedColormap
 
 
 def set_plt_layout():
@@ -231,23 +236,248 @@ def sample_subset(z, n_sample=5000, seed=42):
     idx = torch.randperm(len(z), generator=g)[:n_sample]
     return z[idx], idx.cpu().numpy()
 
+def pairwise_manifold_distance_matrix(manifold_obj, z_points, chunk_size=256):
+    n_points = z_points.shape[0]
+    dist_mat = torch.empty((n_points, n_points), dtype=z_points.dtype, device=z_points.device)
+    for start in range(0, n_points, chunk_size):
+        end = min(start + chunk_size, n_points)
+        dist_mat[start:end] = manifold_obj.dist(
+            z_points[start:end, None, :],
+            z_points[None, :, :]
+        )
+    return dist_mat
+
+def check_distance_matrix_properties(dist_matrix):
+    if not np.allclose(dist_matrix, dist_matrix.T, rtol=1e-4, atol=1e-6):
+        max_err = np.max(np.abs(dist_matrix - dist_matrix.T))
+        print(f"Warning: dist_matrix is not symmetric (max |A-A^T| = {max_err:.6e}), turned into symmetric matrix.")
+        dist_matrix = (dist_matrix + dist_matrix.T) / 2
+    if np.any(dist_matrix < 0):
+        negative_count = np.sum(dist_matrix < 0)
+        min_neg = np.min(dist_matrix)
+        print(f"Warning: dist_matrix contains {negative_count} negative values with minimum {min_neg:.6e}, set to 0.")
+        dist_matrix[dist_matrix < 0] = 0
+    if not np.allclose(np.diag(dist_matrix), 0, rtol=1e-4, atol=1e-6):
+        diag_max = np.max(np.abs(np.diag(dist_matrix)))
+        print(f"Warning: dist_matrix diagonal is not zero (max |diag| = {diag_max:.6e}), set diagonal to 0.")
+        dist_matrix[np.diag_indices_from(dist_matrix)] = 0
+    return dist_matrix
+
+
+def plot_circular_tree(tree, tip_major: dict[str, str], out_path=None, figsize=(22, 22), dpi=300, save_dpi=500):
+    depths = tree.depths()
+    if not depths:
+        raise ValueError("Tree depth calculation returned no values.")
+
+    max_depth = max(depths.values())
+    if max_depth == 0:
+        depths = tree.depths(unit_branch_lengths=True)
+        max_depth = max(depths.values())
+
+    tip_order = tree.get_terminals()
+    y_pos = {tip: i for i, tip in enumerate(tip_order)}
+
+    def set_internal_y(clade):
+        if clade in y_pos:
+            return y_pos[clade]
+        y_pos[clade] = float(np.mean([set_internal_y(child) for child in clade.clades]))
+        return y_pos[clade]
+
+    set_internal_y(tree.root)
+    n_tips = max(len(tip_order), 1)
+
+    def theta(clade):
+        return 2 * np.pi * y_pos[clade] / n_tips
+
+    def radius(clade):
+        return depths.get(clade, 0.0) / max_depth
+
+    def xy(r, th):
+        return r * np.cos(th), r * np.sin(th)
+
+    def draw_edge(parent, child, ax, line_width=0.2):
+        r0, r1 = radius(parent), radius(child)
+        th0, th1 = theta(parent), theta(child)
+
+        dth = (th1 - th0 + np.pi) % (2 * np.pi) - np.pi
+        arc = np.linspace(th0, th0 + dth, 24)
+        ax.plot(r0 * np.cos(arc), r0 * np.sin(arc), color="black", lw=line_width, zorder=1)
+
+        x0, y0 = xy(r0, th1)
+        x1, y1 = xy(r1, th1)
+        ax.plot([x0, x1], [y0, y1], color="black", lw=line_width, zorder=1)
+
+        for grandchild in child.clades:
+            draw_edge(child, grandchild, ax, line_width)
+
+    _, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    for child in tree.root.clades:
+        draw_edge(tree.root, child, ax)
+
+    group_series = pd.Series([tip_major.get(tip.name, "Unknown") for tip in tip_order], dtype="string")
+    cats = group_series.astype("category")
+    codes = cats.cat.codes.to_numpy()
+    groups = list(cats.cat.categories)
+
+    #cmap = plt.get_cmap("magma_r", max(len(groups), 1))
+    colors = (list(plt.get_cmap("tab20").colors) +
+          list(plt.get_cmap("tab20b").colors) +
+          list(plt.get_cmap("tab20c").colors))
+    cmap = ListedColormap(colors[:len(groups)])
+
+    tip_xy = [xy(radius(tip), theta(tip)) for tip in tip_order]
+    tip_x = [pos[0] for pos in tip_xy]
+    tip_y = [pos[1] for pos in tip_xy]
+    ax.scatter(tip_x, tip_y, c=codes, s=5, cmap=cmap, edgecolors="white", linewidths=0.05, zorder=3)
+
+    legend_handles = [
+        Line2D([0], [0], marker="o", linestyle="", markersize=5.5,
+               markerfacecolor=cmap(i), markeredgecolor="none", label=group)
+        for i, group in enumerate(groups)
+    ]
+    ax.legend(legend_handles, groups, title="Major haplogroup", loc="center left",
+              bbox_to_anchor=(1.01, 0.5), frameon=False)
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    plt.tight_layout()
+    plt.savefig(out_path, bbox_inches="tight", dpi=save_dpi)
+
+    counts = group_series.value_counts().sort_index()
+    return {
+        "n_leaves": len(tip_order),
+        "counts": counts,
+        "saved_path": out_path,
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 def compute_dist_matrix(z, manifold, device="cpu"):
     z = z.to(device)
     n = len(z)
     dist_matrix = np.empty((n, n), dtype=np.float32)
-    with torch.no_grad():
-        for i in range(n):
-            if (i + 1) % 100 == 0 or i == n - 1:
-                print(f"Manifold distance progress: {i+1}/{n}", end="\r")
-            d_i = manifold.dist(z[i:i + 1], z).detach().cpu().numpy().squeeze()
-            dist_matrix[i] = d_i
-    print(f"Manifold distance progress: {n}/{n}")
+    for i in tqdm(range(n), desc="Manifold distance", leave=True):
+        with torch.no_grad():
+            d_i = manifold.dist(z[i].unsqueeze(0), z).detach().cpu().numpy().squeeze()
+        dist_matrix[i] = d_i
+    print(f"Manifold distance: {n}/{n}")
     # Check for symmetry
     if not np.allclose(dist_matrix, dist_matrix.T, rtol=1e-4, atol=1e-6):
         max_err = np.max(np.abs(dist_matrix - dist_matrix.T))
         print(f"Warning: dist_matrix is not symmetric (max |A-A^T| = {max_err:.6e})")
+    # Check for non-negativity
+    if np.any(dist_matrix < 0):
+        negative_count = np.sum(dist_matrix < 0)
+        min_neg = np.min(dist_matrix)
+        dist_matrix[dist_matrix < 0] = 0
+        print(f"Warning: dist_matrix contained {negative_count} negative values with minimum {min_neg:.6e}, set to 0.")
     return dist_matrix
+
+
+def compute_dist_matrix_poincare(z, manifold, device="cpu"):
+    z = z.to(device)
+    n = len(z)
+    dist_matrix = np.empty((n, n), dtype=np.float32)
+
+    # If Lorentz, map to Poincare ball and compute distances there
+    if isinstance(manifold, geoopt.manifolds.Lorentz):
+        k = manifold.k
+        def lorentz_to_poincare(x):
+            # x: (N, D+1) with time-like first coord
+            return x[:, 1:] / x[:, :1]
+
+        z_p = lorentz_to_poincare(z)
+        poincare = geoopt.manifolds.PoincareBallExact(c=1.0/k) # or 1.0/k curvature?
+
+        with torch.no_grad():
+            for i in tqdm(range(n), desc="Poincare distance", leave=True):
+                d_i = poincare.dist(z_p[i:i + 1], z_p).detach().cpu().numpy().squeeze()
+                dist_matrix[i] = d_i
+    else:
+        with torch.no_grad():
+            for i in tqdm(range(n), desc="Manifold distance", leave=True):
+                d_i = manifold.dist(z[i:i + 1], z).detach().cpu().numpy().squeeze()
+                dist_matrix[i] = d_i
+
+    print(f"Manifold distance: {n}/{n}")
+    if not np.allclose(dist_matrix, dist_matrix.T, rtol=1e-4, atol=1e-6):
+        max_err = np.max(np.abs(dist_matrix - dist_matrix.T))
+        print(f"Warning: dist_matrix is not symmetric (max |A-A^T| = {max_err:.6e})")
+    return dist_matrix
+
+
+def compute_group_median_dist_matrix(z, group_labels, manifold, device="cpu", project_medians=True):
+    if len(z) != len(group_labels):
+        raise ValueError("z and group_labels must have the same length.")
+
+    z = z.to(device)
+    labels = np.asarray(group_labels, dtype=object)
+    unique_labels = np.unique(labels).tolist()
+
+    group_representatives = []
+    group_counts = []
+    for label in unique_labels:
+        idx = np.where(labels == label)[0]
+        if len(idx) == 0:
+            continue
+        z_group = z[idx]
+        median = torch.median(z_group, dim=0).values
+        if project_medians:
+            median = manifold.projx(median.unsqueeze(0)).squeeze(0)
+        group_representatives.append(median)
+        group_counts.append(len(idx))
+
+    if not group_representatives:
+        raise ValueError("No groups with samples found.")
+
+    reps = torch.stack(group_representatives, dim=0)
+    n = len(reps)
+    dist_matrix = np.empty((n, n), dtype=np.float32)
+    print("Computing group median distance matrix...")
+    for i in tqdm(range(n), desc="Group manifold distance", leave=True):
+        with torch.no_grad():
+            d_i = manifold.dist(reps[i].unsqueeze(0), reps).detach().cpu().numpy().squeeze()
+        dist_matrix[i] = d_i
+    print(f"Group manifold distance: {n}/{n}")
+    if not np.allclose(dist_matrix, dist_matrix.T, rtol=1e-4, atol=1e-6):
+        max_err = np.max(np.abs(dist_matrix - dist_matrix.T))
+        print(f"Warning: group dist_matrix is not symmetric (max |A-A^T| = {max_err:.6e})")
+    if np.any(dist_matrix < 0):
+        negative_count = np.sum(dist_matrix < 0)
+        min_neg = np.min(dist_matrix)
+        dist_matrix[dist_matrix < 0] = 0
+        print(f"Warning: group dist_matrix contained {negative_count} negative values with minimum {min_neg:.6e}, set to 0.")
+
+    return dist_matrix, unique_labels, np.asarray(group_counts, dtype=int)
 
 
 def write_phylip_dist_matrix(dist_matrix, out_path, labels=None, precision=6):
